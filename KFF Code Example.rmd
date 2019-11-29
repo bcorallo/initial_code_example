@@ -1,0 +1,445 @@
+---
+title: "Code Example for KFF Policy Analyst Application"
+author: "Brad Corallo"
+date: "October 14, 2019"
+output: 
+  html_document:
+    df_print: paged
+---
+
+#Background
+
+This document provides an example of my work using the R programming language. In addition to the raw code and output, I provide brief explanations of what each "chunk" of code is doing for those who are not familiar with R. 
+
+In this example, I use data from the [2013 National Ambulatory Medical Care Survey (NAMCS)](https://www.cdc.gov/nchs/ahcd/ahcd_questionnaires.htm) to estimate the pravalence of 14 chronic conditions at visits to Community Health Centers and private practice physicians. I will break down these estimates by age group, providing estimates for patient visits by children (under age 18), working-age patients (ages 18-64), elderly patients (ages 65+), and all patients. After removing estimates considered unreliable by [NCHS standards](https://www.cdc.gov/nchs/ahcd/ahcd_estimation_reliability.htm), I will generate 45 Chi-Squared tests to compare the prevalence of specific chronic conditions by age group. The final output is (1.) a formatted table with all results at the end of this document and (2.) a summary table that only highlights significant findings for easier interpretation.
+
+For more information on this project, I am happy to provide a draft manuscript that discusses the implications of this analysis. The manuscript also explores the prevalence of multiple (concurrent) chronic conditions at visits to Community Health Centers and private practices.
+
+The analysis is divided into 6 sections:
+
+1. [Load the data] 
+2. [Data cleaning] 
+3. [Estimate prevalence of 14 chronic conditions by age group] 
+4. [Run Chi-Squared tests] 
+5. [Format the summary tables]
+6. [Final results of the analysis]
+
+#Load the data 
+
+In this section, I download NAMCS data from the NCHS website and combine (1.) the Community Health Centers (CHC) sample and (2.) the private practice physician (PPP) sample.
+```{r warning=FALSE, message=FALSE, results='hide'}
+#Install and load needed packages for analysis
+package_names <- c("haven", "dplyr", "broom", "forcats", "purrr", "srvyr", "kableExtra")
+
+lapply(package_names, function(x) if(!x %in% installed.packages()) install.packages(x))
+
+lapply(package_names, require, character.only = TRUE)
+
+
+
+#Download CHC data from the NCHS website
+chc_url <-"ftp://ftp.cdc.gov/pub/Health_Statistics/NCHS/dataset_documentation/namcs/spss/namcs2013_chc-spss.zip"
+
+temp <- tempfile()
+temp2 <- tempfile()
+
+download.file(chc_url, temp)
+unzip(zipfile = temp, exdir = temp2)
+chc_data <- read_sav(file.path(temp2, "namcs2013_chc-spss.sav"))
+unlink(c(temp, temp2))
+
+
+
+#Download PPP data from NCHS website
+ppp_url <-"ftp://ftp.cdc.gov/pub/Health_Statistics/NCHS/dataset_documentation/namcs/spss/namcs2013-spss.zip"
+
+temp3 <- tempfile()
+temp4 <- tempfile()
+
+download.file(ppp_url, temp)
+unzip(zipfile = temp, exdir = temp2)
+ppp_data <- read_sav(file.path(temp2, "namcs2013-spss.sav"))
+unlink(c(temp3, temp4))
+
+
+
+#Clear environment of unneeded objects
+rm(list = c("ppp_url", "chc_url", "temp", "temp2", "temp3", "temp4", 
+            "package_names"))
+```
+
+I'll add identifiers before combining the two samples. "CHC" identifies Community Health Centers and "PPP" identifies private practice physicians.
+```{r warning=FALSE, message=FALSE, results='hide'}
+#Add identifiers
+chc_data$id <- "CHC"
+ppp_data$id <- "PPP"
+
+
+
+#Combine the two samples
+##Note: I suppressed warnings for this command -- I'm losing the SPSS
+##variable labels
+namcs_full <- bind_rows(chc_data, ppp_data)
+
+
+
+#Remove unneeded objects from the environement
+rm("chc_data", "ppp_data")
+```
+
+#Data Cleaning 
+
+In this section, I'll do some basic data cleaning, but the most important steps are:
+
+1. Select the variables needed for the analysis, 
+2. Create a "survey object" that calculates correct standard errors for survey data, 
+3. Filter the data to only include visits to primary care physicians and psychiatrists, and 
+4. Remove observations where chronic condition questions were left unanswered (these are roughly equal for CHC and PPP samples).
+```{r}
+#Change variable names to lower case
+names(namcs_full) <- tolower(names(namcs_full))
+
+
+
+#Gather only the needed variables
+namcs_full <- namcs_full %>%
+  select(
+    cstratm, #survey strata
+    cpsum, #primary sampling units available in data set
+    id, #CHC/PPP identifier
+    patwt, #visit weights
+    specr, #physician type/specialty
+    totchron, #count of chronic conditions (also identifies blanks in the
+              ##chronic condition checkboxes)
+    arthrtis:nochron, #binary variables for selected chronic conditions
+    age #age in years
+  )
+
+
+
+#Recode the type of physician
+namcs_full$specr <- as.factor(as.character(namcs_full$specr))
+
+namcs_full$specr <- 
+  fct_recode(namcs_full$specr,
+             "General & Family Practice" = "1",
+             "Internal Medicine" = "3",
+             "Pediatrics" = "4", 
+             "General Surgery" = "5",
+             "OB/GYN" = "6",
+             "Orhopedic Surgery" = "7",
+             "Cardiovascular Diseases" = "8",
+             "Dermatology" = "9",
+             "Urology" = "10",
+             "Psychiatry" = "11",
+             "Neurology" = "12",
+             "Ophthalmology" = "13",
+             "Otolaryngology" = "14",
+             "All Other" = "15",
+             "NP" = "96",
+             "PA" = "97",
+             "CNM" = "98")
+```
+
+The chunk below creates a survey object, then applies filters to (1.) keep only visits to primary care physicians and psychiatrists and (2.) remove blank responses to the chronic conditions questions in the NAMCS instrument. 
+```{r}
+#Create survey objects via the `srvyr` package 
+namcs_full_design <- as_survey_design(namcs_full, strata = cstratm,
+                                      ids = cpsum, weights = patwt)
+
+
+
+#Filter to include only primary care physicians + psychiatrists
+namcs_pcp <- namcs_full_design %>%
+  filter(specr %in% c(
+    "General & Family Practice", 
+    "Psychiatry",
+    "Pediatrics",
+    "OB/GYN",
+    "Internal Medicine"))
+
+#Drop factor levels that are no longer in the data set
+namcs_pcp <- namcs_pcp %>% mutate(specr = fct_drop(specr))
+
+
+
+#Filter to exclude visits where chronic conditions were left blank.
+namcs_pcp <- namcs_pcp %>% filter(totchron != -9)
+
+
+
+#Remove unneeded objects from the environment
+rm("namcs_full", "namcs_full_design")
+```
+
+#Estimate prevalence of 14 chronic conditions by age group
+
+In this section, I'll create a function to return the estimated prevalence of a specified chronic conditions as well as measures to gauge the reliability of the estimate (confidence intervals, standard errors/relative standard errors, and number of observations). 
+```{r}
+prev_estimate <- function (x, age_range = 0:100) {
+  x <- as.name(x)
+  x <- enquo(x)
+
+  #Generate estimate
+  ii <- namcs_pcp %>%
+    filter(age %in% age_range) %>%
+    group_by(id) %>%
+    summarize(n = unweighted(sum(!! x)), #capture the count of observations
+              prop = survey_mean(!! x, na.rm = T, #`prop` = proportion
+                                 vartype = c("ci", "se"))) %>% #get CIs and SEs
+    mutate(prop_RSE = prop_se / prop, #get the relative standard error
+           chron = quo_name(x), #record the name of the chronic condition
+           age_group = paste(min(age_range), "-", max(age_range)))
+  
+  #Some quick reordering for more intuitive output
+  ii <- ii %>% select(id, age_group, chron, prop:prop_RSE, n)
+
+  print(ii)
+  
+}
+```
+
+Below, I run the function for all 14 chronic conditions and each age group (children, working-age, elderly, and all ages).
+```{r results='hide'}
+#Create a list of chronic conditions
+chronics <- names(as.data.frame(namcs_pcp)[7:22])
+chronics <- chronics[-c(3,4)] #Remove measures of asthma severity/control
+
+#Run the function for the list of chronic conditions for each age group.
+##I've suppressed messages for easier reading
+all_ages_prev <- map(chronics, prev_estimate)
+
+kids_prev <- map(chronics, prev_estimate, age_range = 0:17)
+
+working_age_prev <- map(chronics, prev_estimate, age_range = 18:64)
+
+elderly_prev <- map(chronics, prev_estimate, age_range = 65:100)
+```
+
+Below is the unformatted table for prevalence estimates. I'll clean this up as a last step. If you are viewing this on your computer, you can scroll through the estimates using the page numbers in the lower-right corner.
+```{r}
+#Combine all the outputs into one table
+prev_table <- bind_rows(all_ages_prev, elderly_prev, working_age_prev,
+                        kids_prev)
+
+
+
+#Remove unneeded objects from the environment
+rm("all_ages_prev", "elderly_prev", "working_age_prev", "kids_prev")
+
+
+
+prev_table
+```
+
+#Run Chi-Squared tests
+
+In this section, I'll run Chi-Squared tests and add them to the table showing the estimated prevalence of chronic conditions (shown directly above).
+```{r}
+#Create a function to run a Chi-Squared test and print out p values.
+chi_sq_test <- function(chronic, age_range = 0:100){
+  
+  x <- paste("~", chronic, "+ id")
+  x <- as.formula(x)
+  
+  ii <- svychisq(x, design = subset(namcs_pcp, age %in% age_range)) %>%
+    tidy()
+  
+  ii$chron <- chronic
+  ii$age_group <- paste(min(age_range), "-", max(age_range))
+  
+  ii <- ii %>% select(age_group, chron, p.value)
+  
+  print(ii)
+}
+```
+
+Run the function for the list of chronic conditions and for all age groups:
+```{r warning=FALSE, message=FALSE, results='hide'}
+all_ages_chisq <- map(chronics, chi_sq_test) 
+
+kids_chisq <- map(chronics, chi_sq_test, age_range = 0:17) 
+
+working_age_chisq <- map(chronics, chi_sq_test, age_range = 18:64)
+
+elderly_chisq <- map(chronics, chi_sq_test, age_range = 65:100) 
+
+#Combine the outputs into one table
+chisq_table <- bind_rows(all_ages_chisq, elderly_chisq, 
+                         working_age_chisq, kids_chisq)
+
+
+
+#remove unneeded objects from the environment
+rm("all_ages_chisq", "elderly_chisq", "working_age_chisq", "kids_chisq")
+```
+
+Below is the combined table with prevalence estimates and the results of the Chi-Squared tests.
+```{r}
+full_table <- inner_join(prev_table, chisq_table, 
+                         by = c("age_group", "chron"))
+
+
+
+full_table
+```
+
+Below, I remove unreliable estimates based on [NCHS standards](https://www.cdc.gov/nchs/ahcd/ahcd_estimation_reliability.htm). If either the CHC or PPP estimate is unreliable, I will remove both estimates from the table.
+```{r}
+#Since the data table is in "long" format, I'll create a test to see
+##if an estimate is unreliable for either CHCs or PPPs. Then, I'll 
+##remove a test if either the CHC or PPP estimate is unreliable
+full_table <- full_table %>%
+  mutate(
+    unreliable_test = ifelse(n < 30 | prop_RSE > .3, 
+                        1, 0)) #test for unreliability
+
+full_table <- full_table %>%
+  group_by(age_group, chron) %>%
+  mutate(unreliable_group = ifelse(sum(unreliable_test) > 0, 
+                                   "Unreliable", "Keep")) %>%
+  ungroup() #mark CHC and PPP estimate if either is unreliable
+
+full_table <- full_table %>%
+  filter(unreliable_group == "Keep") #filter for only valid tests
+
+```
+
+After filtering out the unreliable estimates, I ran `r nrow(full_table) / 2` tests. We likely have inflated P values, so I'll apply a Bonferroni correction based on a significance level of *P* <= .05. (The final table will include P values to help identify possible false negatives/Type II errors).
+```{r}
+m <- nrow(full_table) / 2 #this gives me the number of tests
+
+full_table <- full_table %>%
+  mutate(
+    significant = ifelse(p.value <= 0.05 / m, "*", "")
+  ) #significance under Bonferroni correction is 0.0011 (m = 45)
+```
+
+
+
+#Format the summary tables
+
+In this section, I'll format the final table. Normally, I would do this in Word or Excel, but I've added this section so you can see the final output.
+```{r}
+#Relabel chronic conditions
+chron_labs <- data.frame(chron = chronics,
+                         chron_lab = c("Arthritis",
+                         "Asthma", "Cancer", "CEBVD", "COPD",
+                         "Chronic Renal Failure", "Chronic Heart Failure",
+                         "Depression", "Diabetes", "Hyperlipidemia",
+                         "Hypertension", "Ischemic Heart Disease",
+                         "Obesity", "Osteoporosis")) 
+
+
+
+#Add chronic conditions labels to table
+full_table <- inner_join(full_table, chron_labs, by = "chron")
+
+
+
+#Format contents to have point estimate and CIs in a single cell
+full_table <- full_table %>%
+  mutate(
+    Prevalence = paste0(round(prop * 100, 1), " (", 
+                        round(prop_low * 100, 1), ", ",
+                        round(prop_upp * 100, 1), ")")
+  )
+
+
+
+#create a "wide" data table, keep only needed variables
+chcs <- full_table %>% filter(id == "CHC")
+chcs <- chcs %>%
+  mutate(CHC_Prevalence = Prevalence) %>%
+  select(age_group, chron_lab, CHC_Prevalence)
+
+ppp <- full_table %>% filter(id == "PPP")
+ppp <- ppp %>% 
+  mutate(PPP_Prevalence = Prevalence) %>%
+  select(age_group, chron_lab, PPP_Prevalence, p.value, significant)
+
+full_table <- inner_join(chcs, ppp, by = c("age_group", "chron_lab"))
+
+rm("chcs", "ppp") #remove unneeded objects from environment
+
+
+
+#Recode the age groups
+full_table <- full_table %>%
+  mutate(age_group = as.factor(age_group),
+         age_group = fct_recode(age_group,
+                                 "All Ages" = "0 - 100",
+                                 "Ages 65+" = "65 - 100",
+                                 "Ages 18-64" = "18 - 64",
+                                 "Under 18" = "0 - 17"))
+
+
+
+#Format the P values
+full_table <- full_table %>% 
+  mutate(p.value = ifelse(
+    p.value < 0.001, "<.001", round(p.value, 3)))
+
+
+
+#Change the column names
+names(full_table) <- c("Age Group", "Chronic Condition", 
+                       "CHC Prevalence (CI)", "PPP Prevalence (CI)",
+                       "P Value", "Sig.")
+```
+
+Next, I'll create a summary table of the findings. With 45 tests to review, it will be helpful to identify only the significantly different chronic conditions.
+```{r}
+#Define chronic conditions with greater prevalence in CHCs vs. PPPs
+summary_table <- data.frame(
+  CHC = c("Obesity", 
+          "Asthma", 
+          rep("\\-", 4), 
+          "Diabetes",
+          "Diabetes", 
+          "Hypertension", 
+          "Obesity", 
+          "Obesity"),
+  PPP = c("Arthritis", 
+          "Cancer", 
+          "Hyperlipidemia", 
+          "Ischemic Heart Disease", 
+          "Osteoporosis",
+          "CEBVD", 
+          "Cancer", 
+          rep("\\-", 4))
+)
+
+#Save formatting options for less typing
+background <- "background-color: #666; color: #fff; text-align: center;"
+
+#Format the table
+summary_table <- kable(summary_table, caption = "Chronic conditions with significantly higher prevalence in visits to Community Health Centers (CHC) or private practice physicians (PPP) by age group, 2013") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE,
+                position = "left") %>%
+  pack_rows("All Ages", 1, 6, 
+            label_row_css = background) %>%
+  pack_rows("Ages 65+", 7, 7, 
+            label_row_css = background) %>%
+  pack_rows("Working Age (18-64)", 8, 10, 
+            label_row_css = background) %>%
+  pack_rows("Children (Under 18)", 11, 11, 
+            label_row_css = background) %>%
+  row_spec(0, align = "center") %>%
+  footnote(general = "Inclusion of a chronic condition in the left column indicates that\nprevalence of this condition was higher among CHC patient visits;\ninclusion in the right column indicates higher prevalence among\nPPP patient visits.")
+```
+
+#Final results of the analysis
+Below are the final results of this analysis. The first table contains estimates of the prevalence of selected chronic conditions for patient visits to CHCs and private practices in 2013. Significance under the Bonferroni correction is *P* <= 0.001 (m = 45), indicated with an asterisk (*) in the `Sig.` column. P values are listed to help identify potential Type II errors (false negatives). You can scroll through age groups by clicking on the page numbers in the lower-right corner of the table. 
+
+The second table provides a summary of significantly different rates of chronic conditions at visits to Community Health Centers and private practices in 2013.
+
+```{r rows.print=14}
+full_table 
+```
+
+```{r}
+summary_table
+```
+
